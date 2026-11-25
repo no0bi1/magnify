@@ -1,6 +1,7 @@
 MAGNIFY_MIN_ZOOM = 1.0
 MAGNIFY_MAX_ZOOM = 1.6
-MAGNIFY_ZOOM_STEP = 0.2
+MAGNIFY_ZOOM_STEP = 1.25 -- each wheel notch multiplies the zoom by this (OpenMap's step)
+MAGNIFY_ZOOM_RATE = 14 -- how fast the zoom closes on its target, per second in log zoom (OpenMap's)
 MAGNIFY_PLAYER_FLASH_INTERVAL = 0.25
 MAGNIFY_PLAYER_FLASH_COUNT = 10
 
@@ -10,6 +11,10 @@ local MAP_WIDTH, MAP_HEIGHT, TILE_SIZE = 1002, 668, 256
 
 local zoom = 1
 local nextClip = 0
+
+-- the wheel zoom in progress: the zoom it is heading for, and the map point (fractions of the map) that
+-- stays under the cursor while it goes
+local anim
 
 -- map fade while the player moves
 local FADE_SPEED = 3 -- alpha units per second
@@ -30,6 +35,7 @@ local nextMoveCheck = 0
 
 -- upvalues
 local abs = math.abs
+local exp, log = math.exp, math.log
 local floor = math.floor
 local min, max = math.min, math.max
 
@@ -287,30 +293,76 @@ function WorldMapFrameScrollFrame_OnMouseUp()
 	this.moved = false
 end
 
-function WorldMapFrameScrollFrame_OnMouseWheel()
-	local scale = this:GetEffectiveScale()
+-- the map point under the cursor, as a fraction of the map, and where the cursor is in the viewport
+local function PointUnderCursor(frame)
+	local scale = frame:GetEffectiveScale()
 	local cursorX, cursorY = GetCursorPosition()
 
-	local frameX = cursorX / scale - this:GetLeft()
-	local frameY = this:GetTop() - cursorY / scale
+	local frameX = cursorX / scale - frame:GetLeft()
+	local frameY = frame:GetTop() - cursorY / scale
 
-	local newZoom = floor((zoom + arg1 * MAGNIFY_ZOOM_STEP) * 1000 + 0.5) / 1000
-	newZoom = max(MAGNIFY_MIN_ZOOM, min(MAGNIFY_MAX_ZOOM, newZoom))
+	return (-frame:GetHorizontalScroll() + frameX) / WorldMapDetailFrame:GetWidth(),
+		(frame:GetVerticalScroll() + frameY) / WorldMapDetailFrame:GetHeight(), frameX, frameY
+end
 
-	if newZoom == zoom then
-		return
-	end
-
-	-- map point under the cursor, as a fraction of the map
-	local mapX = (-this:GetHorizontalScroll() + frameX) / WorldMapDetailFrame:GetWidth()
-	local mapY = (this:GetVerticalScroll() + frameY) / WorldMapDetailFrame:GetHeight()
+-- zooms to `newZoom` keeping the map point (mapX, mapY) under the viewport point (frameX, frameY)
+local function ZoomTo(newZoom, mapX, mapY, frameX, frameY)
+	local frame = WorldMapFrameScrollFrame
+	local zoomedIn = newZoom > MAGNIFY_MIN_ZOOM
 
 	SetZoom(newZoom)
 
-	this.zoomedIn = newZoom > MAGNIFY_MIN_ZOOM
+	if zoomedIn ~= (frame.zoomedIn and true or false) then
+		frame.zoomedIn = zoomedIn
 
-	ApplyClickThrough()
+		ApplyClickThrough()
+	end
+
 	ScrollTo(mapX * WorldMapDetailFrame:GetWidth() - frameX, mapY * WorldMapDetailFrame:GetHeight() - frameY)
+end
+
+function WorldMapFrameScrollFrame_OnMouseWheel()
+	local from = anim and anim.target or zoom
+	local target = max(MAGNIFY_MIN_ZOOM, min(MAGNIFY_MAX_ZOOM, from * (arg1 > 0 and MAGNIFY_ZOOM_STEP or 1 / MAGNIFY_ZOOM_STEP)))
+
+	if target == from then
+		return
+	end
+
+	-- the anchor is taken afresh on every notch, so a zoom already under way carries on from where it is
+	local mapX, mapY, frameX, frameY = PointUnderCursor(this)
+
+	anim = { target = target, mapX = mapX, mapY = mapY, frameX = frameX, frameY = frameY }
+end
+
+-- eases the zoom towards the wheel's target; called every frame the map is up
+local function AnimateZoom(elapsed)
+	local frame = WorldMapFrameScrollFrame
+
+	if frame.panning then
+		-- dragged mid-zoom: what is under the cursor now is what the zoom keeps there, and the drag carries on from here
+		anim.mapX, anim.mapY, anim.frameX, anim.frameY = PointUnderCursor(frame)
+
+		frame.cursorX, frame.cursorY = GetCursorPosition()
+	end
+
+	local newZoom = exp(log(zoom) + (log(anim.target) - log(zoom)) * (1 - exp(-elapsed * MAGNIFY_ZOOM_RATE)))
+	local done = abs(log(anim.target / newZoom)) < 0.003
+
+	if done then
+		newZoom = anim.target
+	end
+
+	ZoomTo(newZoom, anim.mapX, anim.mapY, anim.frameX, anim.frameY)
+
+	if frame.panning then
+		frame.x = -frame:GetHorizontalScroll()
+		frame.y = frame:GetVerticalScroll()
+	end
+
+	if done then
+		anim = nil
+	end
 end
 
 local function WorldMapFrameScrollFrame_OnPan(cursorX, cursorY)
@@ -449,6 +501,10 @@ local function WorldMapButton_OnUpdate()
 	UpdateFade(arg1)
 	UpdateMouse()
 
+	if anim then
+		AnimateZoom(arg1)
+	end
+
 	if WorldMapFrameScrollFrame.panning then
 		WorldMapFrameScrollFrame_OnPan(GetCursorPosition())
 	end
@@ -504,6 +560,7 @@ end
 
 local function WorldMapFrame_OnHide()
 	WorldMapFrameScrollFrame.panning = false
+	anim = nil
 
 	if baseHidden then
 		SetBaseMapHidden(false)
@@ -596,6 +653,8 @@ handler:RegisterEvent('VARIABLES_LOADED')
 handler:SetScript('OnEvent', HandleEvent)
 
 function Magnify_ResetZoom()
+	anim = nil
+
 	SetZoom(MAGNIFY_MIN_ZOOM)
 
 	WorldMapFrameScrollFrame.zoomedIn = false
